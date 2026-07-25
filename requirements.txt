@@ -1,0 +1,5 @@
+# GUI runtime
+PySide6>=6.6,<7
+
+# EXE build tool
+pyinstaller>=6.0,<7
