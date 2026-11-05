@@ -1,119 +1,130 @@
-"""GitHub API client and statistics used by both the CLI and GUI."""
+import json
+import re
 from collections import Counter
-from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.parse import urlparse
-import json
 
-API = "https://api.github.com"
+from translations import translate
+
+
+API_URL = "https://api.github.com"
 
 
 class GitHubError(Exception):
     pass
 
 
-def get_json(path, token=None):
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "GitHubUserActivity/1.0"}
+def get_json(path, token=None, language="en"):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "GithubUserActivity",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    request = Request(API_URL + path, headers=headers)
+
     try:
-        request = Request(API + path, headers=headers)
         with urlopen(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        if exc.code == 404:
-            raise GitHubError("Пользователь не найден")
-        if exc.code == 403:
-            raise GitHubError("GitHub API ограничил запросы. Попробуйте позже или укажите GITHUB_TOKEN.")
-        raise GitHubError(f"GitHub API вернул ошибку {exc.code}")
-    except (URLError, TimeoutError) as exc:
-        raise GitHubError(f"Не удалось подключиться к GitHub: {exc.reason if hasattr(exc, 'reason') else exc}")
-    except json.JSONDecodeError:
-        raise GitHubError("GitHub вернул некорректный ответ")
+    except HTTPError as error:
+        error.close()
+        if error.code == 404:
+            raise GitHubError(translate("not_found", language)) from error
+        if error.code == 401:
+            raise GitHubError(translate("invalid_token", language)) from error
+        if error.code in (403, 429):
+            raise GitHubError(translate("api_limit", language)) from error
+        raise GitHubError(translate("http_error", language, status=error.code)) from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise GitHubError(translate("connection_error", language)) from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise GitHubError(translate("invalid_response", language)) from error
 
 
-def _date(value):
-    if not value:
-        return "—"
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
-    except ValueError:
-        return value
+def validate_username(username, language="en"):
+    username = username.strip().removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", username):
+        raise GitHubError(translate("invalid_username", language))
+    if "--" in username:
+        raise GitHubError(translate("consecutive_hyphens", language))
+    return username
 
 
-def event_text(event):
-    kind = event.get("type", "")
-    repo = event.get("repo", {}).get("name", "unknown/repository")
-    payload = event.get("payload", {})
-    if kind == "PushEvent":
-        count = len(payload.get("commits", [])) or payload.get("size", 1)
-        return f"Pushed {count} commit(s) to {repo}"
-    if kind == "IssuesEvent":
-        action = payload.get("action", "updated")
-        return f"{action.capitalize()} issue in {repo}: {payload.get('issue', {}).get('title', 'без названия')}"
-    if kind == "PullRequestEvent":
-        action = payload.get("action", "updated")
-        return f"{action.capitalize()} pull request in {repo}: {payload.get('pull_request', {}).get('title', 'без названия')}"
-    if kind == "IssueCommentEvent":
-        return f"Commented on an issue in {repo}"
-    if kind == "CreateEvent":
-        return f"Created {payload.get('ref_type', 'object')} in {repo}"
-    if kind == "DeleteEvent":
-        return f"Deleted {payload.get('ref_type', 'object')} in {repo}"
-    if kind == "WatchEvent":
-        return f"Starred {repo}"
-    if kind == "ForkEvent":
-        return f"Forked {repo}"
-    if kind == "ReleaseEvent":
-        return f"Published a release in {repo}"
-    if kind == "PublicEvent":
-        return f"Made {repo} public"
-    return kind.replace("Event", "") or "Activity"
-
-
-def load_user(username, token=None, include_languages=True):
-    username = username.strip().lstrip("@")
-    if not username:
-        raise GitHubError("Введите имя пользователя")
-    user = get_json(f"/users/{username}", token)
-    events = get_json(f"/users/{username}/events?per_page=100", token)
-    repos = get_json(f"/users/{username}/repos?per_page=100&sort=updated", token)
+def load_languages(username, token=None, language="en"):
+    repositories = get_json(f"/users/{username}/repos?per_page=30&sort=updated", token, language)
     languages = Counter()
+
+    for repository in repositories:
+        repository_name = repository["full_name"]
+        repository_languages = get_json(f"/repos/{repository_name}/languages", token, language)
+        for name, byte_count in repository_languages.items():
+            languages[name] += byte_count
+
+    return languages
+
+
+def load_user(username, token=None, include_languages=True, language="en"):
+    username = validate_username(username, language)
+    user = get_json(f"/users/{username}", token, language)
+    events = get_json(f"/users/{username}/events?per_page=100", token, language)
+    languages = Counter()
+    language_error = None
+
     if include_languages:
-        for repo in repos[:30]:
-            try:
-                for language, bytes_count in get_json(repo["languages_url"].replace(API, ""), token).items():
-                    languages[language] += bytes_count
-            except GitHubError:
-                continue
-    event_counts = Counter(e.get("type", "Other").replace("Event", "") for e in events)
-    push_count = sum(1 for e in events if e.get("type") == "PushEvent")
+        try:
+            languages = load_languages(username, token, language)
+        except GitHubError as error:
+            language_error = str(error)
+
     return {
         "user": user,
         "events": events,
-        "repos": repos,
         "languages": languages,
-        "event_counts": event_counts,
-        "contributions": len(events),
-        "pushes": push_count,
-        "fetched_at": datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC"),
+        "language_error": language_error,
     }
 
 
-def load_repository(reference, token=None):
-    """Load repository metadata and language statistics from a URL or owner/name."""
-    reference = reference.strip().rstrip("/")
-    if reference.startswith("http://") or reference.startswith("https://"):
-        parsed = urlparse(reference)
-        if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
-            raise GitHubError("Укажите ссылку на github.com")
-        parts = [part for part in parsed.path.split("/") if part]
-    else:
-        parts = [part for part in reference.split("/") if part]
-    if len(parts) != 2 or any(part in {".", ".."} for part in parts):
-        raise GitHubError("Формат репозитория: owner/repository или https://github.com/owner/repository")
-    owner, name = parts
-    repo = get_json(f"/repos/{owner}/{name}", token)
-    languages = get_json(f"/repos/{owner}/{name}/languages", token)
-    return {"repo": repo, "languages": languages}
+def event_text(event, language="en"):
+    event_type = event.get("type", "")
+    repository = event.get("repo", {}).get("name", "unknown/repository")
+    payload = event.get("payload", {})
+
+    if event_type == "PushEvent":
+        commit_count = payload.get("size")
+        if commit_count is None and "commits" in payload:
+            commit_count = len(payload["commits"])
+        if commit_count is None:
+            return translate("push", language, repository=repository)
+        return translate("push_count", language, count=commit_count, repository=repository)
+
+    if event_type == "IssuesEvent":
+        action = translate(payload.get("action", "updated"), language)
+        title = payload.get("issue", {}).get("title", translate("untitled", language))
+        return translate("issue", language, action=action, repository=repository, title=title)
+
+    if event_type == "PullRequestEvent":
+        action = translate(payload.get("action", "updated"), language)
+        title = payload.get("pull_request", {}).get("title", translate("untitled", language))
+        return translate("pull_request", language, action=action, repository=repository, title=title)
+
+    if event_type == "IssueCommentEvent":
+        return translate("comment", language, repository=repository)
+    if event_type == "CreateEvent":
+        object_name = translate(payload.get("ref_type", "object"), language)
+        return translate("create", language, object=object_name, repository=repository)
+    if event_type == "DeleteEvent":
+        object_name = translate(payload.get("ref_type", "object"), language)
+        return translate("delete", language, object=object_name, repository=repository)
+    if event_type == "WatchEvent":
+        return translate("star", language, repository=repository)
+    if event_type == "ForkEvent":
+        return translate("fork", language, repository=repository)
+    if event_type == "ReleaseEvent":
+        action = translate(payload.get("action", "updated"), language)
+        return translate("release", language, action=action, repository=repository)
+    if event_type == "PublicEvent":
+        return translate("public", language, repository=repository)
+
+    activity = event_type.removesuffix("Event") or "Activity"
+    return translate("activity", language, activity=activity, repository=repository)

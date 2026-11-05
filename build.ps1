@@ -1,11 +1,26 @@
 $ErrorActionPreference = "Stop"
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    python -m pip install -r requirements.txt
-    python -m PyInstaller --clean --onefile --windowed --name github-user-activity-gui gui.py
-    python -m PyInstaller --clean --onefile --console --name github-user-activity-cli cli.py
-    Compress-Archive -Path "dist\github-user-activity-gui.exe", "dist\github-user-activity-cli.exe", "README.md" -DestinationPath "github-user-activity.zip" -Force
-    Write-Host "Created github-user-activity.zip"
-} else {
-    Write-Host "PyInstaller не найден. Установите его командой: python -m pip install pyinstaller"
-    exit 1
+Push-Location $PSScriptRoot
+
+try {
+    if (-not (Test-Path ".venv\Scripts\python.exe")) {
+        if (Get-Command py -ErrorAction SilentlyContinue) {
+            & py -3 -m venv .venv
+        } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+            & python -m venv .venv
+        } else {
+            throw "Python was not found. Install Python and add it to PATH."
+        }
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+
+    & .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    New-Item -ItemType Directory -Path build -Force | Out-Null
+    & .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --console --name GithubUserActivity --specpath build cli.py
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    Write-Host "Created dist\GithubUserActivity.exe"
+} finally {
+    Pop-Location
 }
